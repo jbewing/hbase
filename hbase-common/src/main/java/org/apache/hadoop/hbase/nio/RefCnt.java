@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.nio;
 import com.google.errorprone.annotations.RestrictedApi;
 import org.apache.hadoop.hbase.io.ByteBuffAllocator;
 import org.apache.hadoop.hbase.io.ByteBuffAllocator.Recycler;
+import org.apache.hadoop.util.Preconditions;
 import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.hbase.thirdparty.io.netty.util.AbstractReferenceCounted;
@@ -37,8 +38,31 @@ public class RefCnt extends AbstractReferenceCounted {
 
   private static final ResourceLeakDetector<RefCnt> detector =
     ResourceLeakDetectorFactory.instance().newResourceLeakDetector(RefCnt.class);
-  private final Recycler recycler;
+  private volatile Recycler recycler;
   private final ResourceLeakTracker<RefCnt> leak;
+
+  /**
+   * This class exists such that we can keep the invariant that "this.leak == null" is only true for
+   * the NONE recycler as detector#track can return null
+   */
+  enum NoLeakTracker implements ResourceLeakTracker<RefCnt> {
+    INSTANCE;
+
+    @Override
+    public void record() {
+
+    }
+
+    @Override
+    public void record(Object hint) {
+
+    }
+
+    @Override
+    public boolean close(RefCnt trackedObject) {
+      return true;
+    }
+  }
 
   /**
    * Create an {@link RefCnt} with an initial reference count = 1. If the reference count become
@@ -55,15 +79,34 @@ public class RefCnt extends AbstractReferenceCounted {
   }
 
   public RefCnt(Recycler recycler) {
-    this.recycler = recycler;
-    this.leak = recycler == ByteBuffAllocator.NONE ? null : detector.track(this);
+    this.recycler = Preconditions.checkNotNull(recycler, "recycler cannot be null, pass NONE instead");
+    this.leak = buildLeakTracker(recycler);
   }
 
-  /**
-   * Returns true if this refCnt has a recycler.
-   */
-  public boolean hasRecycler() {
-    return recycler != ByteBuffAllocator.NONE;
+  private ResourceLeakTracker<RefCnt> buildLeakTracker(Recycler recycler) {
+    if (recycler == ByteBuffAllocator.NONE) {
+      return null;
+    }
+
+    ResourceLeakTracker<RefCnt> leakTracker = detector.track(this);
+    if (leakTracker == null) {
+      return NoLeakTracker.INSTANCE;
+    } else {
+      return leakTracker;
+    }
+  }
+
+  public boolean isRecycled() {
+    // TODO: variant 1 is commented below. It performs a check only on the volatile recycler field but shows a pretty large regression for NONE recyclers
+    /*
+    * Recycler r = recycler;
+    * return r != ByteBuffAllocator.NONE && r == null;
+    */
+    // TODO: variant 2 is below which fixes the regression present in variant 1, but shows no real performance improvement
+    // We use leak != null as a replacement for checking this.recycler != ByteBuffAllocator.NONE as it's a
+    // non-volatile field, therefore, we avoid eating a memory barrier when checking recycle status for
+    // ByteBuffAllocator.NONE buffers (micro benchmarks showed the regression being significant)
+    return leak != null && recycler == null;
   }
 
   @Override
@@ -92,7 +135,14 @@ public class RefCnt extends AbstractReferenceCounted {
 
   @Override
   protected final void deallocate() {
-    this.recycler.free();
+    Recycler r = this.recycler;
+    if (r == null) {
+      return;
+    }
+    // set to null before actually releasing to minimize the time window that we could use a recycled instance
+    this.recycler = null;
+    r.free();
+
     if (leak != null) {
       this.leak.close(this);
     }

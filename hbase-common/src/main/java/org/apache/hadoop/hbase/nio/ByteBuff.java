@@ -58,7 +58,6 @@ import org.apache.hbase.thirdparty.io.netty.util.internal.ObjectUtil;
  */
 @InterfaceAudience.Private
 public abstract class ByteBuff implements HBaseReferenceCounted {
-  private static final String REFERENCE_COUNT_NAME = "ReferenceCount";
   private static final int NIO_BUFFER_LIMIT = 64 * 1024; // should not be more than 64KB.
 
   protected RefCnt refCnt;
@@ -73,8 +72,8 @@ public abstract class ByteBuff implements HBaseReferenceCounted {
    * released. So we can avoid the overhead of checking the refCnt on every call. See HBASE-27710.
    */
   protected void checkRefCount() {
-    if (refCnt.hasRecycler()) {
-      ObjectUtil.checkPositive(refCnt(), REFERENCE_COUNT_NAME);
+    if (refCnt.isRecycled()) {
+      throw new IllegalArgumentException("Reference count must be positive! Has this buffer already been released?");
     }
   }
 
